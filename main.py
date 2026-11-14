@@ -13,8 +13,10 @@ past $300 the move is more likely a regime change than noise, and extrapolating
 it would stake a large contrarian bet on a trend still running. Clipping bounds
 the adjustment at $90 while leaving normal days untouched.
 
-Unreadable input and degenerate markets fall back to the last close, and a bad
-case never stops the run.
+Unreadable input and degenerate markets fall back to the last close, and every
+case still gets an output file: a case with no usable price at all is written
+with the last finite price found anywhere in it, or 1.0 when there is none.
+A bad case never stops the run.
 """
 
 import glob
@@ -26,6 +28,7 @@ MOMENTUM_MINUTES = 1440  # one day of one-minute closes
 MOMENTUM_CLIP = 300.0  # dollars of 24h move the model is willing to act on
 REVERSAL = 0.30  # share of the clipped move expected to revert
 MAX_PRICE = 9_999_999.99999  # largest price below the scorer's 10,000,000 cap
+FALLBACK_PRICE = 1.0  # last resort for a case holding no usable positive price
 
 
 def is_price(value):
@@ -48,42 +51,70 @@ def last_finite(prices):
     return None
 
 
+def last_case_price(case):
+    """The last finite price in any "prices" list anywhere in the case, or None.
+
+    Walks the whole structure in document order so the latest series wins; this
+    is the price a degenerate case falls back to.
+    """
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            value = last_finite(node.get("prices"))
+            if value is not None:
+                found.append(value)
+            for key, child in node.items():
+                if key != "prices":
+                    walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(case)
+    return found[-1] if found else None
+
+
+def fallback_price(case):
+    """A positive finite forecast for a case with no usable checkpoint close.
+
+    Uses the last finite price anywhere in the case when it is positive, and
+    1.0 otherwise, so the written price is always positive and finite.
+    """
+    value = last_case_price(case)
+    if value is not None and value > 0.0:
+        return min(value, MAX_PRICE)
+    return FALLBACK_PRICE
+
+
 def checkpoint_series(case):
-    """The series and checkpoint close to forecast from, or (None, fallback).
+    """The price series and its checkpoint close, or (None, None).
 
     Uses the first market that has a usable close, so an empty market list or a
-    market missing "prices" cannot crash the forecast. If no market has one, the
-    last finite price seen anywhere in the case comes back as the fallback.
+    market missing "prices" cannot crash the forecast.
     """
     markets = case.get("markets") if isinstance(case, dict) else None
     if not isinstance(markets, list):
         return None, None
 
-    fallback = None
     for market in markets:
-        if not isinstance(market, dict):
-            continue
-        prices = market.get("prices")
-        close = last_finite(prices)
-        if close is not None:
-            fallback = close
-            break
-
-    if fallback is None:
-        for market in markets:
-            if isinstance(market, dict):
-                close = last_finite(market.get("prices"))
-                if close is not None:
-                    fallback = close
-        return None, fallback
-    return prices, fallback
+        if isinstance(market, dict):
+            prices = market.get("prices")
+            close = last_finite(prices)
+            if close is not None:
+                return prices, close
+    return None, None
 
 
 def forecast_price(case):
-    """The case's forecast, or None when the case holds no usable price."""
+    """The case's forecast; never None, so every case gets an output file.
+
+    A case with no usable close at all falls back to the last finite price
+    anywhere in it, or 1.0 when the case holds no positive finite price.
+    """
     prices, close = checkpoint_series(case)
     if close is None:
-        return None
+        return fallback_price(case)
 
     price = close
     if prices is not None and len(prices) >= MOMENTUM_MINUTES + 1:
@@ -160,18 +191,18 @@ def main():
             with open(path, "r", encoding="utf-8") as handle:
                 case = json.load(handle)
         except (OSError, ValueError) as exc:
-            print("skip %s: unreadable case (%s)" % (stem, exc))
-            continue
+            print("note %s: unreadable case (%s); using fallback" % (stem, exc))
+            case = None
 
         case_id = case_id_of(case, stem)
         try:
             price = forecast_price(case)
         except Exception as exc:  # noqa: BLE001 - a bad case must not stop the run
-            print("skip %s: forecast failed (%s)" % (stem, exc))
-            continue
+            print("note %s: forecast failed (%s); using fallback" % (stem, exc))
+            price = FALLBACK_PRICE
         if price is None:
-            print("skip %s: no usable price" % stem)
-            continue
+            # A missing output is an invalid case, so never leave one unwritten.
+            price = FALLBACK_PRICE
 
         try:
             write_forecast(output_dir, case_id, price)
